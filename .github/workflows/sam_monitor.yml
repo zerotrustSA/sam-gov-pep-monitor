@@ -1,0 +1,58 @@
+name: SAM.gov PEP Monitor
+
+on:
+  schedule:
+    # Runs daily at 7:00 AM ET (12:00 UTC) on weekdays
+    - cron: "0 12 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      lookback_hours:
+        description: "Hours to look back (default 26; use 720 for 30-day backfill)"
+        required: false
+        default: "26"
+      dry_run:
+        description: "Dry run — log found opportunities but skip individual Teams cards"
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Restore state cache
+        uses: actions/cache/restore@v4
+        with:
+          path: state.json
+          key: sam-state-pep-${{ github.run_number }}
+          restore-keys: |
+            sam-state-pep-
+
+      - name: Run monitor
+        env:
+          SAM_API_KEY:       ${{ secrets.SAM_API_KEY }}
+          TEAMS_WEBHOOK_URL: ${{ secrets.TEAMS_WEBHOOK_PEP }}
+          OPENAI_API_KEY:    ${{ secrets.OPENAI_API_KEY }}
+          LOOKBACK_HOURS:    ${{ github.event.inputs.lookback_hours || '26' }}
+          DRY_RUN:           ${{ github.event.inputs.dry_run || 'false' }}
+        run: python sam_monitor.py
+
+      - name: Save state
+        uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: state.json
+          key: sam-state-pep-${{ github.run_number }}
