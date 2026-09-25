@@ -24,6 +24,7 @@ Field layout (custom-field labels should be renamed to match in Unanet admin):
     Project Address          place of performance
     NAICS (Categorization)   NAICS code(s) — Unanet's own field
     Custom Short Text 1-4    PSC · Set-aside · Notice type · Source monitor
+    Custom Short Text 5      SAM.gov link (Unanet has no URL field on opportunities)
     Custom Date 1-2          Posted · Archive
     Custom Long Text 1       attachment links
 """
@@ -168,6 +169,7 @@ class Unanet:
             "OpportunityShortText2": e["set_aside"][:100],
             "OpportunityShortText3": e["notice_type"][:100],
             "OpportunityLongText1":  "\n".join(e["attachments"]),
+            "OpportunityShortText5": e["sam_url"],
         }
         for field, value in (("ProposalDueDate", e["due"]), ("OpportunityDate1", e["posted"]),
                              ("OpportunityDate2", e["archive"])):
