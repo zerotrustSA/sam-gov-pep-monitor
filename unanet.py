@@ -22,7 +22,8 @@ Field layout (custom-field labels should be renamed to match in Unanet admin):
     Opportunity Description  SAM.gov link + notice synopsis
     Note                     contracting office + points of contact
     Project Address          place of performance
-    Custom Short Text 1-5    NAICS · PSC · Set-aside · Notice type · Source monitor
+    NAICS (Categorization)   NAICS code(s) — Unanet's own field
+    Custom Short Text 1-4    PSC · Set-aside · Notice type · Source monitor
     Custom Date 1-2          Posted · Archive
     Custom Long Text 1       attachment links
 """
@@ -163,10 +164,9 @@ class Unanet:
         """Fields that always mirror SAM.gov — refreshed when the notice changes."""
         fields = {
             "SolicitationNumber":    (opp.get("solicitationNumber") or "")[:100],
-            "OpportunityShortText1": e["naics"][:100],
-            "OpportunityShortText2": e["psc"][:100],
-            "OpportunityShortText3": e["set_aside"][:100],
-            "OpportunityShortText4": e["notice_type"][:100],
+            "OpportunityShortText1": e["psc"][:100],
+            "OpportunityShortText2": e["set_aside"][:100],
+            "OpportunityShortText3": e["notice_type"][:100],
             "OpportunityLongText1":  "\n".join(e["attachments"]),
         }
         for field, value in (("ProposalDueDate", e["due"]), ("OpportunityDate1", e["posted"]),
@@ -194,7 +194,7 @@ class Unanet:
             "ExternalId":             opp["noticeId"],
             "OpportunityDescription": f"SAM.gov: {e['sam_url']}\n\n{synopsis}"[:30000],
             "Note":                   self._note(e),
-            "OpportunityShortText5":  f"SAM.gov {self.monitor} monitor",
+            "OpportunityShortText4":  f"SAM.gov {self.monitor} monitor",
             **self._sam_owned(e, opp),
         }
         place = e["place"]
@@ -204,6 +204,22 @@ class Unanet:
             if value:
                 payload[field] = value
         return payload
+
+    # ── NAICS (Unanet's Categorization field) ────────────────────────────────
+    def set_naics(self, opp_id: int, e: dict) -> None:
+        """Attach the notice's NAICS codes. Re-posting a code is a no-op; codes the team
+        added by hand are kept; codes Unanet doesn't recognize are dropped with a warning."""
+        codes = [c.strip() for c in e["naics"].split(",") if c.strip()]
+        if not codes:
+            return
+        try:
+            saved = {n.get("Code") for n in self._post(f"/api/opportunities/{opp_id}/naics",
+                                                       [{"Code": c} for c in codes])}
+            missing = [c for c in codes if c not in saved]
+            if missing:
+                log.warning("Unanet: NAICS %s not recognized for opportunity %s", ", ".join(missing), opp_id)
+        except Exception as ex:
+            log.error("Unanet: NAICS for opportunity %s failed: %s", opp_id, ex)
 
     # ── Contacts ─────────────────────────────────────────────────────────────
     def _contact_id(self, poc: dict, company_id: int) -> Optional[int]:
@@ -279,6 +295,7 @@ class Unanet:
                 if not dry_run:
                     if changes:
                         self._put(f"/api/opportunities/{opp_id}", record, changes)
+                    self.set_naics(opp_id, e)
                     self.link_contacts(opp_id, record.get("ClientId") or client_id, e)
                 return self._count("updated" if changes else "unchanged")
 
@@ -286,6 +303,7 @@ class Unanet:
             if not dry_run:
                 opp_id = self._post("/api/opportunities", [self._new_payload(opp, e, client_id)])[0]["OpportunityId"]
                 log.info("Unanet: created OpportunityId %s", opp_id)
+                self.set_naics(opp_id, e)
                 self.link_contacts(opp_id, client_id, e)
             return self._count("created")
         except Exception as ex:

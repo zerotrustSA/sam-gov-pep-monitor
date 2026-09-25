@@ -80,7 +80,7 @@ def _split_name(full: str) -> tuple[str, str]:
     if (not first or not last or len(words) > 4 or ORG_WORDS & words
             or any(ch.isdigit() or ch in "/@&" for ch in full)):
         return "", ""
-    fix = (lambda s: s.title()) if full.isupper() else (lambda s: s)
+    fix = (lambda s: s.title()) if (full.isupper() or full.islower()) else (lambda s: s)
     return fix(first), fix(last)
 
 

@@ -48,6 +48,12 @@ jobs:
           OPENAI_API_KEY:    ${{ secrets.OPENAI_API_KEY }}
           LOOKBACK_HOURS:    ${{ github.event.inputs.lookback_hours || '26' }}
           DRY_RUN:           ${{ github.event.inputs.dry_run || 'false' }}
+          # Unanet CRM sync — sandbox until the production company tree is built
+          UNANET_ENV:        sandbox
+          UNANET_FIRM_ID:    "3348"
+          UNANET_USERNAME:   ${{ secrets.UNANET_USERNAME }}
+          UNANET_PASSWORD:   ${{ secrets.UNANET_PASSWORD }}
+          UNANET_API_KEY:    ${{ secrets.UNANET_API_KEY }}
         run: python sam_monitor.py
 
       - name: Save state
