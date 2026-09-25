@@ -20,7 +20,7 @@ company (matched on email, never duplicated) and are linked to the opportunity.
 
 Field layout (custom-field labels should be renamed to match in Unanet admin):
     Opportunity Description  SAM.gov link + notice synopsis
-    Note                     contracting office + points of contact
+    Note                     SAM.gov link + contracting office + points of contact (Summary section)
     Project Address          place of performance
     NAICS (Categorization)   NAICS code(s) — Unanet's own field
     Custom Short Text 1-4    PSC · Set-aside · Notice type · Source monitor
@@ -178,12 +178,14 @@ class Unanet:
         return fields
 
     def _note(self, e: dict) -> str:
-        lines = []
+        """Shown on the opportunity's Summary section, so the SAM.gov link goes first."""
+        lines = [f"SAM.gov: {e['sam_url']}"]
         if e["office"] or e["office_addr"]:
             lines.append("Contracting office: " + " — ".join(p for p in [e["office"], e["office_addr"]] if p))
         for p in e["pocs"]:
             detail = " · ".join(x for x in [p["email"], p["phone"]] if x)
-            lines.append(f"{(p['type'] or 'POC').title()} POC: {p['name']}" + (f" · {detail}" if detail else ""))
+            name = f"{p['first']} {p['last']}" if p["first"] else p["name"]  # proper case when SAM sends ALL CAPS
+            lines.append(f"{(p['type'] or 'POC').title()} POC: {name}" + (f" · {detail}" if detail else ""))
         return "\n".join(lines)
 
     def _new_payload(self, opp: dict, e: dict, client_id: int) -> dict:
