@@ -20,11 +20,12 @@ company (matched on email, never duplicated) and are linked to the opportunity.
 
 Field layout (custom-field labels should be renamed to match in Unanet admin):
     Opportunity Description  SAM.gov link + notice synopsis
-    Note                     SAM.gov link + contracting office + points of contact (Summary section)
+    Note                     contracting office + points of contact
     Project Address          place of performance
     NAICS (Categorization)   NAICS code(s) — Unanet's own field
     Custom Short Text 1-4    PSC · Set-aside · Notice type · Source monitor
-    Custom Short Text 5      SAM.gov link (Unanet has no URL field on opportunities)
+    Custom Short Text 5      SAM.gov link (the "External URL" field built in Unanet's field designer
+                             is not exposed by this API; the link also leads the Description)
     Custom Date 1-2          Posted · Archive
     Custom Long Text 1       attachment links
 """
@@ -178,8 +179,8 @@ class Unanet:
         return fields
 
     def _note(self, e: dict) -> str:
-        """Shown on the opportunity's Summary section, so the SAM.gov link goes first."""
-        lines = [f"SAM.gov: {e['sam_url']}"]
+        """Contracting office and points of contact (the SAM.gov link leads the Description)."""
+        lines = []
         if e["office"] or e["office_addr"]:
             lines.append("Contracting office: " + " — ".join(p for p in [e["office"], e["office_addr"]] if p))
         for p in e["pocs"]:
