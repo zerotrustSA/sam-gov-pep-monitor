@@ -26,6 +26,8 @@ Field layout (custom-field labels should be renamed to match in Unanet admin):
     Custom Short Text 1-4    PSC · Set-aside · Notice type · Source monitor (legacy slots)
     Designer custom fields   External URL (if available) = SAM.gov link · Other ID = notice ID ·
                              Other ID Source = "SAM"  (v2 REST API; looked up by label)
+    Type (primary category)  CSO Call · BAA Call · IDIQ Multiple/Single Award · Task Order  (only if empty)
+    Small/DB Type            from the SAM.gov set-aside code                                (only if empty)
     Custom Date 1-2          Posted · Archive
     Custom Long Text 1       attachment links
 """
@@ -54,6 +56,33 @@ SUCCESS = {"created", "updated", "unchanged", "unmatched"}
 
 # Custom fields built in Unanet's field designer (only reachable through the v2 REST API).
 CF_URL, CF_OTHER_ID, CF_SOURCE, CF_SOURCE_VALUE = "External URL (if available)", "Other ID", "Other ID Source", "SAM"
+
+# Categories (value lists in Unanet admin). Matched by name; a name that no longer exists is skipped.
+TYPE_BY_MONITOR = {"CSO": "CSO Call", "BAA": "BAA Call"}
+SET_ASIDE_CATEGORY = {
+    "SBA": "Small Business Set Aside Program", "SBP": "Small Business Set Aside Program",
+    "8A": "8(a) Business Development Program", "8AN": "8(a) Business Development Program",
+    "HZC": "HUBZone Empowerment Contracting Program", "HZS": "HUBZone Empowerment Contracting Program",
+    "SDVOSBC": "Service-Disabled Veteran-Owned Small Business", "SDVOSBS": "Service-Disabled Veteran-Owned Small Business",
+    "WOSB": "Woman-Owned Small Business", "WOSBSS": "Woman-Owned Small Business",
+    "EDWOSB": "Woman-Owned Small Business", "EDWOSBSS": "Woman-Owned Small Business",
+    "VSA": "Veteran-Owner Small Business", "VSS": "Veteran-Owner Small Business",
+}
+
+
+def opportunity_type(monitor: str, opp: dict) -> Optional[str]:
+    """Unanet 'Type' category for a notice, or None when no option fits."""
+    text = f" {opp.get('title') or ''} {opp.get('_matched_profile') or ''} ".upper()
+    if "TASK ORDER" in text:
+        return "Task Order"
+    if monitor in TYPE_BY_MONITOR:
+        return TYPE_BY_MONITOR[monitor]
+    if monitor == "IDIQ":
+        if any(k in text for k in ("SINGLE AWARD", "SINGLE-AWARD", "SATOC")):
+            return "IDIQ Single Award"
+        if any(k in text for k in ("MULTIPLE AWARD", "MULTIPLE-AWARD", "MATOC", "MACC", " MAC ", "MAC-", "GWAC")):
+            return "IDIQ Multiple Award"
+    return None
 
 # Returned by GET but must not be sent back on PUT.
 READ_ONLY = {
@@ -117,6 +146,7 @@ class Unanet:
         }
         self.codes = self._load_company_codes()
         self.cf = self._load_custom_fields()
+        self.types, self.small_db = self._load_categories()
         log.info("Unanet (%s): %d company codes loaded; designer fields: %s", self.env, len(self.codes),
                  ", ".join(sorted(self.cf)) or "none")
 
@@ -257,6 +287,35 @@ class Unanet:
             log.error("Unanet: custom fields for opportunity %s failed: %s", opp_id, ex)
             self.counts["custom field errors"] += 1
 
+    # ── Categories: Type and Small/DB Type ───────────────────────────────────
+    def _load_categories(self) -> tuple[dict[str, int], dict[str, int]]:
+        try:
+            types = {c["CategoryName"]: c["PrimaryCategoryId"] for c in self._get("/api/opportunities/primarycategories")
+                     if c.get("IsAvailable") and not c.get("IsDeleted")}
+            small = {c["SecondaryCategoryName"]: c["SecondaryCategoryID"] for c in self._get("/api/opportunities/secondarycategories")
+                     if c.get("AvailableCat") and not c.get("DeleteCat")}
+            return types, small
+        except Exception as ex:
+            log.warning("Unanet: category lists unavailable (%s); Type / Small-DB Type skipped", ex)
+            return {}, {}
+
+    def set_categories(self, opp_id: int, opp: dict) -> None:
+        """Fill Type and Small/DB Type only when empty, so values the team sets are kept."""
+        wanted = [
+            ("primarycategories", "PrimaryCategoryId", self.types.get(opportunity_type(self.monitor, opp) or "")),
+            ("secondarycategories", "SecondaryCategoryID",
+             self.small_db.get(SET_ASIDE_CATEGORY.get((opp.get("typeOfSetAside") or "").strip().upper(), ""))),
+        ]
+        for kind, key, cat_id in wanted:
+            if not cat_id:
+                continue
+            try:
+                if not self._get(f"/api/opportunities/{opp_id}/{kind}"):
+                    self._post(f"/api/opportunities/{opp_id}/{kind}", [{key: cat_id}])
+            except Exception as ex:
+                log.error("Unanet: %s for opportunity %s failed: %s", kind, opp_id, ex)
+                self.counts["category errors"] += 1
+
     # ── NAICS (Unanet's Categorization field) ────────────────────────────────
     def set_naics(self, opp_id: int, e: dict) -> None:
         """Attach the notice's NAICS codes. Re-posting a code is a no-op; codes the team
@@ -349,6 +408,7 @@ class Unanet:
                         self._put(f"/api/opportunities/{opp_id}", record, changes)
                     self.set_naics(opp_id, e)
                     self.set_custom_fields(opp_id, e, notice_id)
+                    self.set_categories(opp_id, opp)
                     self.link_contacts(opp_id, record.get("ClientId") or client_id, e)
                 return self._count("updated" if changes else "unchanged")
 
@@ -358,6 +418,7 @@ class Unanet:
                 log.info("Unanet: created OpportunityId %s", opp_id)
                 self.set_naics(opp_id, e)
                 self.set_custom_fields(opp_id, e, notice_id)
+                self.set_categories(opp_id, opp)
                 self.link_contacts(opp_id, client_id, e)
             return self._count("created")
         except Exception as ex:
@@ -379,6 +440,8 @@ class Unanet:
             parts.append(f"{c['contacts created']} new contacts")
         if c["contact errors"]:
             parts.append(f"{c['contact errors']} contact errors")
+        if c["category errors"]:
+            parts.append(f"{c['category errors']} category errors")
         if c["custom field errors"]:
             parts.append(f"{c['custom field errors']} custom-field errors")
         return ", ".join(parts) + ("" if self.env == "prod" else f" ({self.env})")
