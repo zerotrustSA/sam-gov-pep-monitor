@@ -23,9 +23,9 @@ Field layout (custom-field labels should be renamed to match in Unanet admin):
     Note                     contracting office + points of contact
     Project Address          place of performance
     NAICS (Categorization)   NAICS code(s) — Unanet's own field
-    Custom Short Text 1-4    PSC · Set-aside · Notice type · Source monitor
-    Custom Short Text 5      SAM.gov link (the "External URL" field built in Unanet's field designer
-                             is not exposed by this API; the link also leads the Description)
+    Custom Short Text 1-4    PSC · Set-aside · Notice type · Source monitor (legacy slots)
+    Designer custom fields   External URL (if available) = SAM.gov link · Other ID = notice ID ·
+                             Other ID Source = "SAM"  (v2 REST API; looked up by label)
     Custom Date 1-2          Posted · Archive
     Custom Long Text 1       attachment links
 """
@@ -51,6 +51,9 @@ DEFAULT_ROLE_ID = 0        # Unanet's default opportunity-contact role
 SAM_CODE = re.compile(r"^\d{3}(\.|$)")  # company IDs that hold a SAM org code
 RECENT_CHECK = 200         # newest records scanned to cover search-index lag
 SUCCESS = {"created", "updated", "unchanged", "unmatched"}
+
+# Custom fields built in Unanet's field designer (only reachable through the v2 REST API).
+CF_URL, CF_OTHER_ID, CF_SOURCE, CF_SOURCE_VALUE = "External URL (if available)", "Other ID", "Other ID Source", "SAM"
 
 # Returned by GET but must not be sent back on PUT.
 READ_ONLY = {
@@ -113,7 +116,9 @@ class Unanet:
             "Content-Type":      "application/json",
         }
         self.codes = self._load_company_codes()
-        log.info("Unanet (%s): %d company codes loaded", self.env, len(self.codes))
+        self.cf = self._load_custom_fields()
+        log.info("Unanet (%s): %d company codes loaded; designer fields: %s", self.env, len(self.codes),
+                 ", ".join(sorted(self.cf)) or "none")
 
     # ── API helpers ──────────────────────────────────────────────────────────
     def _get(self, path: str, **params):
@@ -170,7 +175,6 @@ class Unanet:
             "OpportunityShortText2": e["set_aside"][:100],
             "OpportunityShortText3": e["notice_type"][:100],
             "OpportunityLongText1":  "\n".join(e["attachments"]),
-            "OpportunityShortText5": e["sam_url"],
         }
         for field, value in (("ProposalDueDate", e["due"]), ("OpportunityDate1", e["posted"]),
                              ("OpportunityDate2", e["archive"])):
@@ -209,6 +213,49 @@ class Unanet:
             if value:
                 payload[field] = value
         return payload
+
+    # ── Designer custom fields (v2 REST) ─────────────────────────────────────
+    def _load_custom_fields(self) -> dict[str, tuple[str, Optional[str]]]:
+        """{label: (DefinitionId, key of the "SAM" option for select fields)} for the fields we fill."""
+        try:
+            cfg = self._get("/v2/api/rest/opportunities/custom-fields/configuration")["Response"]
+        except Exception as ex:
+            log.warning("Unanet: designer custom fields unavailable (%s); External URL / Other ID skipped", ex)
+            return {}
+        out = {}
+        for c in cfg:
+            if c.get("Label") in (CF_URL, CF_OTHER_ID, CF_SOURCE) and c.get("Enabled"):
+                key = next((v["Key"] for v in c.get("SelectValues") or [] if v.get("Value") == CF_SOURCE_VALUE), None)
+                out[c["Label"]] = (c["DefinitionId"], key)
+        missing = {CF_URL, CF_OTHER_ID, CF_SOURCE} - set(out)
+        if missing:
+            log.warning("Unanet: designer custom fields not found: %s", ", ".join(sorted(missing)))
+        return out
+
+    def set_custom_fields(self, opp_id: int, e: dict, notice_id: str) -> None:
+        """External URL, Other ID and Other ID Source — written only where the value differs."""
+        want = {}
+        if CF_URL in self.cf:
+            want[self.cf[CF_URL][0]] = e["sam_url"]
+        if CF_OTHER_ID in self.cf:
+            want[self.cf[CF_OTHER_ID][0]] = notice_id
+        if CF_SOURCE in self.cf and self.cf[CF_SOURCE][1]:
+            want[self.cf[CF_SOURCE][0]] = self.cf[CF_SOURCE][1]
+        if not want:
+            return
+        try:
+            current = {v["DefinitionId"]: (v.get("Values") or [None])[0]
+                       for v in self._get(f"/v2/api/rest/opportunities/{opp_id}/custom-fields/values")["Response"]}
+            changes = [{"DefinitionId": d, "Values": [v]} for d, v in want.items() if current.get(d) != v]
+            if changes:
+                r = requests.put(f"{self.base}/v2/api/rest/opportunities/{opp_id}/custom-fields/values",
+                                 headers=self.headers, json={"Values": changes, "UpdateModifiedDate": True}, timeout=30)
+                r.raise_for_status()
+                if not r.json().get("Success", True):
+                    raise RuntimeError(r.json().get("ValidationErrors"))
+        except Exception as ex:
+            log.error("Unanet: custom fields for opportunity %s failed: %s", opp_id, ex)
+            self.counts["custom field errors"] += 1
 
     # ── NAICS (Unanet's Categorization field) ────────────────────────────────
     def set_naics(self, opp_id: int, e: dict) -> None:
@@ -301,6 +348,7 @@ class Unanet:
                     if changes:
                         self._put(f"/api/opportunities/{opp_id}", record, changes)
                     self.set_naics(opp_id, e)
+                    self.set_custom_fields(opp_id, e, notice_id)
                     self.link_contacts(opp_id, record.get("ClientId") or client_id, e)
                 return self._count("updated" if changes else "unchanged")
 
@@ -309,6 +357,7 @@ class Unanet:
                 opp_id = self._post("/api/opportunities", [self._new_payload(opp, e, client_id)])[0]["OpportunityId"]
                 log.info("Unanet: created OpportunityId %s", opp_id)
                 self.set_naics(opp_id, e)
+                self.set_custom_fields(opp_id, e, notice_id)
                 self.link_contacts(opp_id, client_id, e)
             return self._count("created")
         except Exception as ex:
@@ -330,4 +379,6 @@ class Unanet:
             parts.append(f"{c['contacts created']} new contacts")
         if c["contact errors"]:
             parts.append(f"{c['contact errors']} contact errors")
+        if c["custom field errors"]:
+            parts.append(f"{c['custom field errors']} custom-field errors")
         return ", ".join(parts) + ("" if self.env == "prod" else f" ({self.env})")
