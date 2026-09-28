@@ -173,30 +173,43 @@ def _get_with_retry(params: dict) -> Optional[dict]:
     raise RuntimeError("SAM.gov request not resolved after 4 attempts")
 
 
+def _fetch(ptype: str, posted_from: str, posted_to: str) -> tuple[list[dict], int]:
+    data = _get_with_retry({
+        "api_key":    SAM_API_KEY,
+        "keyword":    "solicitation",   # required but ignored — returns all records
+        "postedFrom": posted_from,
+        "postedTo":   posted_to,
+        "limit":      PAGE_LIMIT,
+        "offset":     0,
+        "ptype":      ptype,
+    })
+    if data is None:
+        return [], 0
+    return data.get("opportunitiesData") or [], data.get("totalRecords", 0) or 0
+
+
 def fetch_all_in_window(posted_from: str, posted_to: str) -> list[dict]:
-    """Fetch every opportunity in the date window, one request per notice type."""
+    """Fetch every opportunity in the date window, one request per notice type. A notice type
+    that hits the page cap (long windows, e.g. Monday catching up on the weekend) is re-fetched
+    one day at a time."""
     results = []
     for ptype in NOTICE_TYPES:
-        data = _get_with_retry({
-            "api_key":    SAM_API_KEY,
-            "keyword":    "solicitation",   # required but ignored — returns all records
-            "postedFrom": posted_from,
-            "postedTo":   posted_to,
-            "limit":      PAGE_LIMIT,
-            "offset":     0,
-            "ptype":      ptype,
-        })
-        if data is None:
-            continue
-
-        opps  = data.get("opportunitiesData") or []
-        total = data.get("totalRecords", 0) or 0
-        results.extend(opps)
+        opps, total = _fetch(ptype, posted_from, posted_to)
         if total > len(opps):
-            log.warning(
-                "ptype=%s returned %d of %d records — page cap hit, some notices skipped",
-                ptype, len(opps), total,
-            )
+            log.info("ptype=%s: %d records exceed one page — fetching day by day", ptype, total)
+            opps = []
+            day = datetime.strptime(posted_from, "%m/%d/%Y")
+            last = datetime.strptime(posted_to, "%m/%d/%Y")
+            while day <= last:
+                d = day.strftime("%m/%d/%Y")
+                day_opps, day_total = _fetch(ptype, d, d)
+                opps.extend(day_opps)
+                if day_total > len(day_opps):
+                    log.warning("ptype=%s %s returned %d of %d records — page cap hit, some notices skipped",
+                                ptype, d, len(day_opps), day_total)
+                day += timedelta(days=1)
+                time.sleep(0.25)
+        results.extend(opps)
         time.sleep(0.25)
 
     log.info("Fetched %d total records from SAM.gov (%s → %s)", len(results), posted_from, posted_to)
@@ -435,6 +448,7 @@ def post_run_summary(
 # state.json, so a Teams outage never blocks Unanet (or vice versa); anything
 # that fails is kept as "pending" and retried on later runs.
 PENDING_LIMIT   = 100
+MAX_LOOKBACK_HOURS = 14 * 24
 DELIVERED_LIMIT = 5000
 
 
@@ -444,6 +458,20 @@ def notice_key(opp: dict) -> str:
         f"{opp.get('postedDate')}{opp.get('responseDeadLine')}{opp.get('title')}".encode()
     ).hexdigest()[:8]
     return f"{opp.get('noticeId')}:{update_hash}"
+
+
+def lookback_hours(state: dict, now: datetime) -> float:
+    """Cover everything since the last successful fetch, so Monday picks up Friday afternoon and
+    the weekend and a failed day is caught up next run. Never less than LOOKBACK_HOURS."""
+    last = state.get("last_fetch") or state.get("last_run")
+    hours = float(LOOKBACK_HOURS)
+    if last:
+        try:
+            since = (now - datetime.fromisoformat(last)).total_seconds() / 3600 + 2
+            hours = max(hours, min(since, MAX_LOOKBACK_HOURS))
+        except ValueError:
+            pass
+    return hours
 
 
 def delivery_state(state: dict) -> tuple[dict, dict]:
@@ -464,10 +492,11 @@ def main() -> None:
     filtered_keys = list(state.get("filtered", []))  # judged not IPSecure fit (re-judged if SAM updates them)
     not_fit = set(filtered_keys)
 
-    lookback = now - timedelta(hours=LOOKBACK_HOURS)
+    hours = lookback_hours(state, now)
+    lookback = now - timedelta(hours=hours)
     posted_from = lookback.strftime("%m/%d/%Y")
     posted_to   = now.strftime("%m/%d/%Y")
-    log.info("Checking SAM.gov from %s to %s", posted_from, posted_to)
+    log.info("Checking SAM.gov from %s to %s (lookback %.0fh)", posted_from, posted_to, hours)
 
     sam_api_ok = True
     try:
@@ -571,6 +600,8 @@ def main() -> None:
         state["seen_ids"]  = state["delivered"]["teams"]  # kept so an older version could still read this file
         state["filtered"]  = filtered_keys[-DELIVERED_LIMIT:]
     state["last_run"] = now.isoformat()
+    if sam_api_ok and not DRY_RUN:
+        state["last_fetch"] = now.isoformat()
     save_state(state)
 
     log.info("Done — %d new, %d updated, %d already seen, %d not IPSecure fit",
