@@ -109,6 +109,36 @@ def html_to_text(raw: str) -> str:
     return text.strip()
 
 
+# Sentences that appear in most notices and say nothing about the work.
+BOILERPLATE_SENTENCE = re.compile(
+    r"not a request for (proposals?|quotes?|quotations?)|for informational (and planning )?purposes only|"
+    r"not (to )?be construed|no funds (are )?available|under no obligation|responses? in any form are not offers|"
+    r"will not (pay|reimburse)|not responsible for|strictly voluntary|^\W*disclaimer\b|at no cost to the government",
+    re.IGNORECASE)
+
+
+def short_synopsis(text: str, limit: int = 750) -> str:
+    """First sentences of a synopsis, without markdown or standard disclaimers, cut at a sentence end."""
+    if not text:
+        return ""
+    flat = re.sub(r"[*_#`]+", "", text)                 # markdown SAM.gov leaves in
+    flat = re.sub(r"\s+", " ", flat).strip()
+    sentences = [x.strip() for x in re.split(r"(?<=[.!?])\s+(?=[A-Z0-9(\"'•])", flat) if x.strip()]
+    kept, size, cut = [], 0, False
+    for sentence in sentences:
+        if BOILERPLATE_SENTENCE.search(sentence):
+            continue
+        if kept and size + len(sentence) + 1 > limit:
+            cut = True
+            break
+        kept.append(sentence)
+        size += len(sentence) + 1
+    short = " ".join(kept)
+    if len(short) > limit:                  # one very long opening sentence
+        short, cut = short[:limit].rsplit(" ", 1)[0], True
+    return short + (" …" if cut else "")
+
+
 def fetch_synopsis(notice_id: str, api_key: str) -> Optional[str]:
     try:
         r = requests.get(NOTICE_DESC_URL, params={"noticeid": notice_id, "api_key": api_key}, timeout=30)

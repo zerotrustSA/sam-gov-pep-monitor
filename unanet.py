@@ -19,7 +19,7 @@ Contracting officers from the notice become Unanet contacts under the matched
 company (matched on email, never duplicated) and are linked to the opportunity.
 
 Field layout (custom-field labels should be renamed to match in Unanet admin):
-    Opportunity Description  SAM.gov link + notice synopsis
+    Opportunity Description  shortened synopsis (~750 chars, disclaimers removed); link lives in External URL
     Note                     contracting office + points of contact
     Project Address          place of performance
     NAICS (Categorization)   NAICS code(s) — Unanet's own field
@@ -224,14 +224,14 @@ class Unanet:
         return "\n".join(lines)
 
     def _new_payload(self, opp: dict, e: dict, client_id: int) -> dict:
-        synopsis = e["synopsis"] or "Synopsis not available — see the SAM.gov link above."
+        synopsis = enrich.short_synopsis(e["synopsis"]) or "Synopsis not available on SAM.gov."
         payload = {
             "OpportunityName":        (opp.get("title") or opp["noticeId"])[:255],
             "ClientId":               client_id,
             "StageId":                self.stage_id,
             "ActiveInd":              1,
             "ExternalId":             opp["noticeId"],
-            "OpportunityDescription": f"SAM.gov: {e['sam_url']}\n\n{synopsis}"[:30000],
+            "OpportunityDescription": f"{synopsis}\n\nFull notice: see External URL.",
             "Note":                   self._note(e),
             "OpportunityShortText4":  f"SAM.gov {self.monitor} monitor",
             **self._sam_owned(e, opp),
