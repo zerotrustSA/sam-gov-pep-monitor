@@ -26,7 +26,8 @@ Field layout (custom-field labels should be renamed to match in Unanet admin):
     Custom Short Text 1-4    PSC · Set-aside · Notice type · Source monitor (legacy slots)
     Designer custom fields   External URL (if available) = SAM.gov link · Other ID = notice ID ·
                              Other ID Source = "SAM"  (v2 REST API; looked up by label)
-    Documents                SAM.gov attachments, uploaded shared; ones that can't be fetched are
+    Documents                SAM.gov attachments on the opportunity's Documents tab (IsPrivate=true;
+                             false moves them to "Shared Documents"); ones that can't be fetched are
                              listed in the Note ("Attachments not retrieved from SAM.gov: ...")
     Type (primary category)  CSO Call · BAA Call · BPA · OTA · IDIQ Multiple/Single Award · Task Order  (only if empty)
     Small/DB Type            from the SAM.gov set-aside code                                (only if empty)
@@ -344,7 +345,7 @@ class Unanet:
         return name, r.content, ""
 
     def sync_attachments(self, opp_id: int, e: dict) -> None:
-        """Upload the notice's files to the opportunity's Documents (shared). Files already
+        """Upload the notice's files to the opportunity's Documents tab. Files already
         uploaded (same content) are skipped, so amendments only add what's new."""
         if not e.get("files"):
             return
@@ -370,9 +371,9 @@ class Unanet:
                 if not r.ok:
                     problems.append(f"{name} (upload to Unanet failed: HTTP {r.status_code})")
                     continue
-                for doc in r.json():  # uploads default to Private; share with the team
+                for doc in r.json():  # keep IsPrivate as uploaded: that is the opportunity's own Documents tab
                     self._put(f"/api/opportunities/{opp_id}/documents/{doc['DocumentId']}", doc,
-                              {"IsPrivate": False, "Description": "SAM.gov attachment", "Source": "SAM.gov"})
+                              {"Description": "SAM.gov attachment", "Source": "SAM.gov"})
                     existing.add(doc.get("FileMD5"))
                 self.counts["attachments added"] += 1
             except Exception as ex:
