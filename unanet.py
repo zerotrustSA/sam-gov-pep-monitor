@@ -26,15 +26,20 @@ Field layout (custom-field labels should be renamed to match in Unanet admin):
     Custom Short Text 1-4    PSC · Set-aside · Notice type · Source monitor (legacy slots)
     Designer custom fields   External URL (if available) = SAM.gov link · Other ID = notice ID ·
                              Other ID Source = "SAM"  (v2 REST API; looked up by label)
+    Documents                SAM.gov attachments, uploaded shared; ones that can't be fetched are
+                             listed in the Note ("Attachments not retrieved from SAM.gov: ...")
     Type (primary category)  CSO Call · BAA Call · BPA · OTA · IDIQ Multiple/Single Award · Task Order  (only if empty)
     Small/DB Type            from the SAM.gov set-aside code                                (only if empty)
     Custom Date 1-2          Posted · Archive
     Custom Long Text 1       attachment links
 """
 
+import hashlib
 import logging
+import mimetypes
 import os
 import re
+import urllib.parse
 from collections import Counter
 from typing import Optional
 
@@ -316,6 +321,81 @@ class Unanet:
                 log.error("Unanet: %s for opportunity %s failed: %s", kind, opp_id, ex)
                 self.counts["category errors"] += 1
 
+    # ── Attachments (SAM.gov files -> Unanet Documents) ──────────────────────
+    NOT_RETRIEVED = "Attachments not retrieved from SAM.gov:"
+
+    @staticmethod
+    def _download(url: str) -> tuple[Optional[str], Optional[bytes], str]:
+        """(filename, bytes, problem). SAM.gov links redirect to public file storage;
+        controlled (CUI / export-controlled) files need a SAM.gov login and fail here."""
+        fallback = url.rstrip("/").split("/")[-2] if url.rstrip("/").endswith("download") else url.rsplit("/", 1)[-1]
+        try:
+            r = requests.get(url, timeout=300, allow_redirects=True)
+        except Exception as ex:
+            return fallback, None, f"download failed ({type(ex).__name__})"
+        name = re.search(r"filename\*?=(?:UTF-8'')?\"?([^\";]+)", r.headers.get("Content-Disposition", ""))
+        name = urllib.parse.unquote_plus(name.group(1)).strip() if name else fallback
+        if r.status_code in (401, 403):
+            return name, None, "requires SAM.gov login (controlled attachment)"
+        if r.status_code != 200:
+            return name, None, f"HTTP {r.status_code}"
+        if "text/html" in r.headers.get("Content-Type", "") and not name.lower().endswith((".htm", ".html")):
+            return name, None, "SAM.gov returned a web page instead of the file (login may be required)"
+        return name, r.content, ""
+
+    def sync_attachments(self, opp_id: int, e: dict) -> None:
+        """Upload the notice's files to the opportunity's Documents (shared). Files already
+        uploaded (same content) are skipped, so amendments only add what's new."""
+        if not e.get("files"):
+            return
+        try:
+            existing = {d.get("FileMD5") for d in self._get(f"/api/opportunities/{opp_id}/documents")}
+        except Exception as ex:
+            log.error("Unanet: documents for opportunity %s unreadable: %s", opp_id, ex)
+            self.counts["attachments not retrieved"] += len(e["files"])
+            return
+        upload_headers = {k: v for k, v in self.headers.items() if k != "Content-Type"}
+        problems = []
+        for url in e["files"]:
+            name, data, problem = self._download(url)
+            if problem:
+                problems.append(f"{name} ({problem})")
+                continue
+            if hashlib.md5(data).hexdigest() in existing:
+                continue
+            try:
+                ctype = mimetypes.guess_type(name)[0] or "application/octet-stream"  # Unanet rejects parts without one
+                r = requests.post(f"{self.base}/api/documents/opportunities/{opp_id}", headers=upload_headers,
+                                  files={"file": (name, data, ctype)}, timeout=600)
+                if not r.ok:
+                    problems.append(f"{name} (upload to Unanet failed: HTTP {r.status_code})")
+                    continue
+                for doc in r.json():  # uploads default to Private; share with the team
+                    self._put(f"/api/opportunities/{opp_id}/documents/{doc['DocumentId']}", doc,
+                              {"IsPrivate": False, "Description": "SAM.gov attachment", "Source": "SAM.gov"})
+                    existing.add(doc.get("FileMD5"))
+                self.counts["attachments added"] += 1
+            except Exception as ex:
+                problems.append(f"{name} (upload to Unanet failed: {type(ex).__name__})")
+        if problems:
+            self.counts["attachments not retrieved"] += len(problems)
+            log.warning("Unanet: %d attachment(s) not retrieved for opportunity %s: %s", len(problems), opp_id, "; ".join(problems))
+            self._note_problems(opp_id, problems)
+
+    def _note_problems(self, opp_id: int, problems: list[str]) -> None:
+        """List files that couldn't be retrieved in the Note (shown on the Summary), once each."""
+        try:
+            record = self._get(f"/api/opportunities/{opp_id}")
+            note = record.get("Note") or ""
+            new = [p for p in problems if p not in note]
+            if not new:
+                return
+            if self.NOT_RETRIEVED not in note:
+                note = (note + "\n" if note else "") + self.NOT_RETRIEVED
+            self._put(f"/api/opportunities/{opp_id}", record, {"Note": note + "".join(f"\n• {p}" for p in new)})
+        except Exception as ex:
+            log.error("Unanet: could not note missing attachments on %s: %s", opp_id, ex)
+
     # ── NAICS (Unanet's Categorization field) ────────────────────────────────
     def set_naics(self, opp_id: int, e: dict) -> None:
         """Attach the notice's NAICS codes. Re-posting a code is a no-op; codes the team
@@ -410,6 +490,7 @@ class Unanet:
                     self.set_custom_fields(opp_id, e, notice_id)
                     self.set_categories(opp_id, opp)
                     self.link_contacts(opp_id, record.get("ClientId") or client_id, e)
+                    self.sync_attachments(opp_id, e)
                 return self._count("updated" if changes else "unchanged")
 
             log.info("Unanet: %screate %s -> %s (%s)", would, title, client_name, client_id)
@@ -420,6 +501,7 @@ class Unanet:
                 self.set_custom_fields(opp_id, e, notice_id)
                 self.set_categories(opp_id, opp)
                 self.link_contacts(opp_id, client_id, e)
+                self.sync_attachments(opp_id, e)
             return self._count("created")
         except Exception as ex:
             log.error("Unanet: failed for %s (%s): %s", notice_id, title, ex)
@@ -440,6 +522,10 @@ class Unanet:
             parts.append(f"{c['contacts created']} new contacts")
         if c["contact errors"]:
             parts.append(f"{c['contact errors']} contact errors")
+        if c["attachments added"]:
+            parts.append(f"{c['attachments added']} attachments added")
+        if c["attachments not retrieved"]:
+            parts.append(f"{c['attachments not retrieved']} attachments not retrieved")
         if c["category errors"]:
             parts.append(f"{c['category errors']} category errors")
         if c["custom field errors"]:

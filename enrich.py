@@ -194,9 +194,8 @@ def enrich(opp: dict, sam_api_key: str = "", synopsis: bool = False) -> dict:
     pocs.sort(key=lambda p: p["type"] != "primary")
 
     naics = opp.get("naicsCodes") or ([opp["naicsCode"]] if opp.get("naicsCode") else [])
-    attachments = [u for u in (opp.get("resourceLinks") or []) if u]
-    if opp.get("additionalInfoLink"):
-        attachments.append(opp["additionalInfoLink"])
+    files = [u for u in (opp.get("resourceLinks") or []) if u]          # downloadable attachments
+    attachments = files + ([opp["additionalInfoLink"]] if opp.get("additionalInfoLink") else [])
 
     e = {
         "sam_url":     f"https://sam.gov/opp/{notice_id}/view" if notice_id else "https://sam.gov",
@@ -216,6 +215,7 @@ def enrich(opp: dict, sam_api_key: str = "", synopsis: bool = False) -> dict:
         "due_display": pretty_date(opp.get("responseDeadLine")) or "See SAM.gov",
         "archive":     _date(opp.get("archiveDate")),
         "attachments": attachments,
+        "files":       files,
         "synopsis":    fetch_synopsis(notice_id, sam_api_key) if synopsis and notice_id and sam_api_key else None,
         "synopsis_fetched": bool(synopsis and notice_id and sam_api_key),  # don't refetch a missing one
     }
