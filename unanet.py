@@ -26,7 +26,7 @@ Field layout (custom-field labels should be renamed to match in Unanet admin):
     Custom Short Text 1-4    PSC · Set-aside · Notice type · Source monitor (legacy slots)
     Designer custom fields   External URL (if available) = SAM.gov link · Other ID = notice ID ·
                              Other ID Source = "SAM"  (v2 REST API; looked up by label)
-    Type (primary category)  CSO Call · BAA Call · IDIQ Multiple/Single Award · Task Order  (only if empty)
+    Type (primary category)  CSO Call · BAA Call · BPA · OTA · IDIQ Multiple/Single Award · Task Order  (only if empty)
     Small/DB Type            from the SAM.gov set-aside code                                (only if empty)
     Custom Date 1-2          Posted · Archive
     Custom Long Text 1       attachment links
@@ -58,7 +58,7 @@ SUCCESS = {"created", "updated", "unchanged", "unmatched"}
 CF_URL, CF_OTHER_ID, CF_SOURCE, CF_SOURCE_VALUE = "External URL (if available)", "Other ID", "Other ID Source", "SAM"
 
 # Categories (value lists in Unanet admin). Matched by name; a name that no longer exists is skipped.
-TYPE_BY_MONITOR = {"CSO": "CSO Call", "BAA": "BAA Call"}
+TYPE_BY_MONITOR = {"CSO": "CSO Call", "BAA": "BAA Call", "BPA": "BPA", "OTA": "OTA"}
 SET_ASIDE_CATEGORY = {
     "SBA": "Small Business Set Aside Program", "SBP": "Small Business Set Aside Program",
     "8A": "8(a) Business Development Program", "8AN": "8(a) Business Development Program",
