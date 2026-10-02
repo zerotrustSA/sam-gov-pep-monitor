@@ -54,6 +54,11 @@ jobs:
           UNANET_USERNAME:   ${{ secrets.UNANET_USERNAME }}
           UNANET_PASSWORD:   ${{ secrets.UNANET_PASSWORD }}
           UNANET_API_KEY:    ${{ secrets.UNANET_API_KEY }}
+          # SharePoint landing list — off until these secrets exist
+          SP_TENANT_ID:      ${{ secrets.SP_TENANT_ID }}
+          SP_CLIENT_ID:      ${{ secrets.SP_CLIENT_ID }}
+          SP_CLIENT_SECRET:  ${{ secrets.SP_CLIENT_SECRET }}
+          SP_SITE:           ${{ secrets.SP_SITE }}
         run: python sam_monitor.py
 
       - name: Save state

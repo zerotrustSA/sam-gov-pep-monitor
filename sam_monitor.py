@@ -16,6 +16,7 @@ import requests
 
 import enrich
 import fit
+import sharepoint
 import unanet
 
 # ── Logging ─────────────────────────────────────────────────────────────────
@@ -367,6 +368,7 @@ def post_run_summary(
     opportunities: list = None,
     unanet_status: str = None,
     filtered: list = None,
+    sharepoint_status: str = None,
     filtered_before: int = 0,
 ) -> None:
     """opportunities = the IPSecure-fit ones; filtered = (title, reason) judged not fit this run."""
@@ -400,7 +402,8 @@ def post_run_summary(
                 kv("SAM.gov",        sam_status),
                 kv("GitHub Actions", "Scheduled ✅"),
                 kv("Teams",          teams_status),
-            ] + ([kv("Unanet", unanet_status)] if unanet_status else [])},
+            ] + ([kv("Unanet", unanet_status)] if unanet_status else [])
+              + ([kv("SharePoint", sharepoint_status)] if sharepoint_status else [])},
         ]},
     ]
 
@@ -445,8 +448,9 @@ def post_run_summary(
 # ── Main ─────────────────────────────────────────────────────────────────────
 # Flow: SAM.gov query -> relevance filter -> enrich once -> deliver to each
 # destination independently. Each destination keeps its own "delivered" list in
-# state.json, so a Teams outage never blocks Unanet (or vice versa); anything
-# that fails is kept as "pending" and retried on later runs.
+# state.json, so a Teams outage never blocks Unanet or SharePoint (or vice versa);
+# anything that fails is kept as "pending" and retried on later runs.
+DESTINATIONS    = ("teams", "unanet", "sharepoint")
 PENDING_LIMIT   = 100
 MAX_LOOKBACK_HOURS = 14 * 24
 DELIVERED_LIMIT = 5000
@@ -476,10 +480,11 @@ def lookback_hours(state: dict, now: datetime) -> float:
 
 def delivery_state(state: dict) -> tuple[dict, dict]:
     """delivered/pending per destination. Older state files only had seen_ids (= Teams)."""
-    delivered = state.get("delivered") or {"teams": list(state.get("seen_ids", [])), "unanet": []}
-    pending = state.get("pending") or {"teams": [], "unanet": []}
+    delivered = state.get("delivered") or {"teams": list(state.get("seen_ids", []))}
+    pending = state.get("pending") or {}
     for d in (delivered, pending):
-        d.setdefault("teams", []); d.setdefault("unanet", [])
+        for dest in DESTINATIONS:
+            d.setdefault(dest, [])
     return delivered, pending
 
 
@@ -507,15 +512,22 @@ def main() -> None:
         sam_api_ok = False
     log.info("Total unique opportunities found: %d", len(opportunities))
 
-    # Destinations. Unanet is optional — off unless its secrets are set.
+    # Destinations. Unanet and SharePoint are optional — each is off unless its secrets are set.
     destinations = ["teams"]
-    crm = None
+    crm = sp = None
     if unanet.enabled():
         destinations.append("unanet")
         try:
             crm = unanet.Unanet()
         except Exception as e:
             log.error("Unanet unavailable this run: %s", e)
+    if sharepoint.enabled():
+        destinations.append("sharepoint")
+        try:
+            sp = sharepoint.SharePoint()
+        except Exception as e:
+            log.error("SharePoint unavailable this run: %s", e)
+    records = {"unanet": crm, "sharepoint": sp}  # record-keeping destinations (get the synopsis)
 
     # This run's work: fresh notices, then anything still pending from earlier runs.
     work, queued = [], set()
@@ -529,7 +541,7 @@ def main() -> None:
 
     new_count = updated_count = already_seen = 0
     teams_ok = True
-    still_pending = {"teams": [], "unanet": []}
+    still_pending = {dest: [] for dest in DESTINATIONS}
     fit_opps, filtered_now, filtered_before = [], [], 0
 
     for opp in work:
@@ -557,18 +569,19 @@ def main() -> None:
             filtered_keys.append(key)
             continue
         fit_opps.append(opp)
+        opp["_fit"] = reason
 
         is_update = opp["noticeId"] in teams_notices
         log.info("[%s] %s — %s (to: %s; fit: %s)", "UPDATE" if is_update else "NEW",
                  opp.get("_matched_profile"), opp.get("title", "")[:80], ", ".join(todo), reason)
-        enrich.enrich(opp, SAM_API_KEY, synopsis="unanet" in todo and crm is not None)
+        enrich.enrich(opp, SAM_API_KEY, synopsis=any(records.get(d) for d in todo))
 
         for dest in todo:
             if DRY_RUN:
                 if dest == "teams":
                     log.info("[DRY RUN] Would post to Teams: %s", opp.get("title", "")[:100])
-                elif crm:
-                    crm.upsert(opp, dry_run=True)
+                elif records[dest]:
+                    records[dest].upsert(opp, dry_run=True)
                 continue
 
             if dest == "teams":
@@ -579,8 +592,10 @@ def main() -> None:
                 except Exception as e:
                     log.error("Teams post failed for %s: %s", opp["noticeId"], e)
                     ok = teams_ok = False
-            else:
+            elif dest == "unanet":
                 ok = bool(crm) and crm.upsert(opp) in unanet.SUCCESS
+            else:
+                ok = bool(sp) and sp.upsert(opp) in sharepoint.SUCCESS
 
             if ok:
                 done[dest].add(key)
@@ -617,10 +632,18 @@ def main() -> None:
             unanet_status += f" · {len(still_pending['unanet'])} pending retry"
         log.info("Unanet: %s", unanet_status)
 
+    sharepoint_status = None
+    if "sharepoint" in destinations:
+        sharepoint_status = sp.summary(dry_run=DRY_RUN) if sp else "Error ❌"
+        if still_pending["sharepoint"]:
+            sharepoint_status += f" · {len(still_pending['sharepoint'])} pending retry"
+        log.info("SharePoint: %s", sharepoint_status)
+
     try:
         post_run_summary(now, len(opportunities), new_count, updated_count, already_seen, sam_api_ok, teams_ok,
                          opportunities=fit_opps, unanet_status=unanet_status,
-                         filtered=filtered_now, filtered_before=filtered_before)
+                         filtered=filtered_now, filtered_before=filtered_before,
+                         sharepoint_status=sharepoint_status)
     except Exception as e:
         log.error("Failed to post run summary: %s", e)
 
