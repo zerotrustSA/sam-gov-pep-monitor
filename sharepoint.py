@@ -16,8 +16,12 @@ Lists (built once by provision_sharepoint.py, from the column specs below):
 
 Ownership: SAM-owned columns are refreshed when the notice changes. Disposition, Owner,
 Team notes, Unanet opportunity ID, and Customer/Service after the item is created belong
-to the team and are never written. Unlike the Unanet sync, notices outside the customer
-list still land (Customer left empty), so the list is the complete triage queue.
+to the team and are never written. Contract type(s) is multi-select and each monitor only
+adds its own type, so a notice several monitors match (e.g. an IDIQ that is also a BPA)
+keeps every type whatever order they run in; if two monitors create the same notice at
+once, the unique Notice ID rejects the second and it merges into the first instead.
+Unlike the Unanet sync, notices outside the customer list still land (Customer left
+empty), so the list is the complete triage queue.
 """
 
 import logging
@@ -58,10 +62,16 @@ def _date(name, display, with_time=False):
             "dateTime": {"format": "dateTime" if with_time else "dateOnly", "displayAs": "standard"}}
 
 
-def _choice(name, display, choices, **extra):
-    return {"name": name, "displayName": display,
-            "choice": {"choices": choices, "allowTextEntry": True, "displayAs": "dropDownMenu"}, **extra}
+def _choice(name, display, choices, multi=False, **extra):
+    """multi=True: check boxes, i.e. a multi-select (MultiChoice) column."""
+    return {"name": name, "displayName": display, **extra,
+            "choice": {"choices": choices, "allowTextEntry": True, "displayAs": "checkBoxes" if multi else "dropDownMenu"}}
 
+
+# A notice can match several monitors (e.g. an IDIQ that is also a BPA). Each monitor only ever
+# ADDS its type to this multi-select column, so the result is the same whatever order they run in.
+CONTRACT_TYPES = ["CSO", "IDIQ", "BPA", "BAA", "OTA", "PEP", "CRADA"]
+MULTI = "Collection(Edm.String)"
 
 # Column specs, in display order. Internal names are what the sync writes.
 CUSTOMER_COLUMNS = [
@@ -79,7 +89,7 @@ OPP_COLUMNS = [
             defaultValue={"value": "New"}),
     {"name": "Owner", "displayName": "Owner",
      "personOrGroup": {"allowMultipleSelection": False, "chooseFromType": "peopleOnly"}},
-    _choice("ContractType", "Contract type", ["CSO", "IDIQ", "BPA", "BAA", "OTA", "PEP", "CRADA"]),
+    _choice("ContractType", "Contract type(s)", CONTRACT_TYPES, multi=True),
     "CUSTOMER_LOOKUP",                                    # filled in by provisioning (needs the list id)
     _text("Service", "Service"),
     _text("Agency", "Agency / command"),
@@ -166,6 +176,13 @@ def _safe_name(name: str) -> str:
     return re.sub(r'["*:<>?/\\|#%]', "_", name).strip().rstrip(".") or "attachment"
 
 
+def _types(value) -> list[str]:
+    """A multi-choice value as Graph returns it (a list; tolerate a single string)."""
+    if isinstance(value, list):
+        return [str(v) for v in value if v]
+    return [value] if isinstance(value, str) and value else []
+
+
 def _same(key: str, current, new) -> bool:
     current = "" if current is None else str(current)
     if key in DATE_ONLY:
@@ -216,7 +233,6 @@ class SharePoint:
         fields = {
             "Title":              (opp.get("title") or opp["noticeId"])[:255],
             "SamLink":            e["sam_url"][:255],
-            "ContractType":       self.monitor,
             "Agency":             e["agency_line"][:255],
             "Office":             " — ".join(p for p in [e["office"], e["office_addr"]] if p)[:255],
             "SolicitationNumber": (opp.get("solicitationNumber") or "")[:255],
@@ -241,38 +257,60 @@ class SharePoint:
         notice_id = opp.get("noticeId") or ""
         title = (opp.get("title") or "")[:70]
         e = opp.get("_e") or enrich.enrich(opp)
-        would = "[DRY RUN] would " if dry_run else ""
         stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         try:
             fields = self._sam_owned(opp, e)
             existing = self.find_item(notice_id)
-            if existing:
-                current = existing.get("fields") or {}
-                if e["synopsis"] is None and current.get("Synopsis") not in (None, "", NOT_AVAILABLE):
-                    fields.pop("Synopsis")      # synopsis not fetched this run: keep the one already there
-                changes = {k: v for k, v in fields.items() if not _same(k, current.get(k), v)}
-                if changes:
-                    log.info("SharePoint: %supdate item %s (%s): %s", would, existing["id"], title, sorted(changes))
-                if not dry_run:
-                    if changes:
-                        self.g.call("PATCH", f"{self.items}/{existing['id']}/fields", json={**changes, "SamUpdated": stamp})
-                    self.sync_attachments(existing["id"], notice_id, e, current)
-                return self._count("updated" if changes else "unchanged")
-
-            match = unanet.best_match(opp.get("fullParentPathCode") or "", self.codes)
-            new = {**fields, "NoticeId": notice_id, "SamUpdated": stamp}
-            if match:
-                new.update({"CustomerLookupId": str(match[0]), "Service": match[2]})
-            else:
-                self.counts["no customer match"] += 1
-            log.info("SharePoint: %screate %s -> %s", would, title, match[1] if match else "no customer match")
-            if not dry_run:
-                item = self.g.call("POST", self.items, json={"fields": new})
-                self.sync_attachments(item["id"], notice_id, e, {})
-            return self._count("created")
+            if not existing:
+                try:
+                    self._create(opp, e, fields, notice_id, title, stamp, dry_run)
+                    return self._count("created")
+                except requests.HTTPError:
+                    # Notice ID is unique: an overlapping monitor may have created it a moment ago.
+                    existing = self.find_item(notice_id)
+                    if not existing:
+                        raise
+                    log.info("SharePoint: %s was just created by another monitor — merging", notice_id)
+            return self._count(self._update(existing, e, fields, notice_id, title, stamp, dry_run))
         except Exception as ex:
             log.error("SharePoint: failed for %s (%s): %s", notice_id, title, ex)
             return self._count("failed")
+
+    def _create(self, opp: dict, e: dict, fields: dict, notice_id: str, title: str, stamp: str, dry_run: bool) -> None:
+        match = unanet.best_match(opp.get("fullParentPathCode") or "", self.codes)
+        new = {**fields, "NoticeId": notice_id, "SamUpdated": stamp}
+        if self.monitor in CONTRACT_TYPES:
+            new.update({"ContractType@odata.type": MULTI, "ContractType": [self.monitor]})
+        if match:
+            new.update({"CustomerLookupId": str(match[0]), "Service": match[2]})
+        log.info("SharePoint: %screate %s -> %s", "[DRY RUN] would " if dry_run else "", title,
+                 match[1] if match else "no customer match")
+        if not dry_run:
+            item = self.g.call("POST", self.items, json={"fields": new})
+            self.sync_attachments(item["id"], notice_id, e, {})
+        if not match:
+            self.counts["no customer match"] += 1
+
+    def _update(self, existing: dict, e: dict, fields: dict, notice_id: str, title: str, stamp: str,
+                dry_run: bool) -> str:
+        current = existing.get("fields") or {}
+        if e["synopsis"] is None and current.get("Synopsis") not in (None, "", NOT_AVAILABLE):
+            fields.pop("Synopsis")      # synopsis not fetched this run: keep the one already there
+        changes = {k: v for k, v in fields.items() if not _same(k, current.get(k), v)}
+        have = _types(current.get("ContractType"))
+        if self.monitor in CONTRACT_TYPES and self.monitor not in have:   # add, never remove
+            merged = set(have) | {self.monitor}
+            changes["ContractType"] = [t for t in CONTRACT_TYPES if t in merged] + sorted(merged - set(CONTRACT_TYPES))
+        if changes:
+            log.info("SharePoint: %supdate item %s (%s): %s", "[DRY RUN] would " if dry_run else "",
+                     existing["id"], title, sorted(changes))
+        if not dry_run:
+            if changes:
+                if "ContractType" in changes:
+                    changes["ContractType@odata.type"] = MULTI
+                self.g.call("PATCH", f"{self.items}/{existing['id']}/fields", json={**changes, "SamUpdated": stamp})
+            self.sync_attachments(existing["id"], notice_id, e, current)
+        return "updated" if changes else "unchanged"
 
     # ── Attachments (SAM.gov files -> Opportunity Documents/<notice id>/) ────
     def _folder(self, notice_id: str) -> dict:
